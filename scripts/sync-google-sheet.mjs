@@ -1,10 +1,12 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DEFAULT_SHEET_ID = "1SiYSX-_g3t-9mnZJu-edTG5wMdlaKAisceqK9GCDSWs";
 const SHEET_ID = process.env.WENLIU_SHEET_ID || DEFAULT_SHEET_ID;
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const allowedTypes = new Set(["paragraph", "heading", "quote", "bullet", "number", "callout"]);
 
 function parseCsv(input) {
   const rows = [];
@@ -64,6 +66,116 @@ function table(rows, expectedHeaders, sheetName) {
     .map((row) => Object.fromEntries(headers.map((header, index) => [header, row[index] ?? ""])));
 }
 
+function validateArticle(article, origin) {
+  if (!article || typeof article !== "object") throw new Error(`${origin} 不是文章对象`);
+  if (!article.id || !article.title) throw new Error(`${origin} 缺少 id 或 title`);
+  if (!Array.isArray(article.blocks) || !article.blocks.length) {
+    throw new Error(`${origin} 没有正文块`);
+  }
+  for (const block of article.blocks) {
+    if (!allowedTypes.has(block.type)) throw new Error(`${origin} 未知正文类型：${block.type}`);
+    if (typeof block.text !== "string" || !block.text.trim()) {
+      throw new Error(`${origin} 存在空正文块`);
+    }
+  }
+  return {
+    id: article.id,
+    title: article.title,
+    deck: article.deck ?? "",
+    sourceName: article.sourceName ?? "",
+    sourceUrl: article.sourceUrl ?? "",
+    originalLanguage: article.originalLanguage ?? "",
+    publishedAt: article.publishedAt ?? "",
+    archivedAt: article.archivedAt ?? "",
+    tags: Array.isArray(article.tags)
+      ? article.tags.map((tag) => String(tag).trim()).filter(Boolean)
+      : String(article.tags ?? "")
+          .split("|")
+          .map((tag) => tag.trim())
+          .filter(Boolean),
+    readingMinutes: Number(article.readingMinutes) || 1,
+    blocks: article.blocks.map((block) => {
+      const next = { type: block.type, text: block.text };
+      if (block.level) next.level = Number(block.level);
+      return next;
+    }),
+  };
+}
+
+function articlesFromSheet(articleRows, blockRows) {
+  const blocksByArticle = new Map();
+  for (const row of blockRows) {
+    if (!allowedTypes.has(row.type)) throw new Error(`未知正文类型：${row.type}`);
+    const block = { type: row.type, text: row.text };
+    if (row.level) block.level = Number(row.level);
+    const current = blocksByArticle.get(row.article_id) || [];
+    current.push({ seq: Number(row.seq), block });
+    blocksByArticle.set(row.article_id, current);
+  }
+
+  return articleRows
+    .filter((row) => row.status === "published")
+    .map((row) => {
+      const blocks = (blocksByArticle.get(row.id) || [])
+        .sort((a, b) => a.seq - b.seq)
+        .map(({ block }) => block);
+      return validateArticle(
+        {
+          id: row.id,
+          title: row.title,
+          deck: row.deck,
+          sourceName: row.source_name,
+          sourceUrl: row.source_url,
+          originalLanguage: row.original_language,
+          publishedAt: row.published_at,
+          archivedAt: row.archived_at,
+          tags: row.tags,
+          readingMinutes: row.reading_minutes,
+          blocks,
+        },
+        `sheet:${row.id || "(missing-id)"}`,
+      );
+    });
+}
+
+async function loadInboxArticles() {
+  const dir = resolve(root, "data/inbox");
+  if (!existsSync(dir)) return [];
+
+  const files = (await readdir(dir))
+    .filter((name) => name.endsWith(".json"))
+    .sort();
+  const articles = [];
+
+  for (const name of files) {
+    const raw = JSON.parse(await readFile(resolve(dir, name), "utf8"));
+    const list = Array.isArray(raw) ? raw : Array.isArray(raw.articles) ? raw.articles : [raw];
+    for (const [index, item] of list.entries()) {
+      articles.push(validateArticle(item, `inbox:${name}#${index}`));
+    }
+  }
+  return articles;
+}
+
+function mergeArticles(sheetArticles, inboxArticles) {
+  const byId = new Map();
+  for (const article of sheetArticles) byId.set(article.id, article);
+
+  let added = 0;
+  let replaced = 0;
+  for (const article of inboxArticles) {
+    if (byId.has(article.id)) replaced += 1;
+    else added += 1;
+    byId.set(article.id, article);
+  }
+
+  return {
+    articles: [...byId.values()],
+    added,
+    replaced,
+  };
+}
+
 const articleRows = table(
   await getSheet("Articles"),
   ["id", "title", "deck", "source_name", "source_url", "original_language", "published_at", "archived_at", "tags", "reading_minutes", "status"],
@@ -75,39 +187,9 @@ const blockRows = table(
   "Blocks",
 );
 
-const allowedTypes = new Set(["paragraph", "heading", "quote", "bullet", "number", "callout"]);
-const blocksByArticle = new Map();
-for (const row of blockRows) {
-  if (!allowedTypes.has(row.type)) throw new Error(`未知正文类型：${row.type}`);
-  const block = { type: row.type, text: row.text };
-  if (row.level) block.level = Number(row.level);
-  const current = blocksByArticle.get(row.article_id) || [];
-  current.push({ seq: Number(row.seq), block });
-  blocksByArticle.set(row.article_id, current);
-}
-
-const articles = articleRows
-  .filter((row) => row.status === "published")
-  .map((row) => {
-    if (!row.id || !row.title) throw new Error("已发布文章缺少 id 或 title");
-    const blocks = (blocksByArticle.get(row.id) || [])
-      .sort((a, b) => a.seq - b.seq)
-      .map(({ block }) => block);
-    if (!blocks.length) throw new Error(`文章 ${row.id} 没有正文块`);
-    return {
-      id: row.id,
-      title: row.title,
-      deck: row.deck,
-      sourceName: row.source_name,
-      sourceUrl: row.source_url,
-      originalLanguage: row.original_language,
-      publishedAt: row.published_at,
-      archivedAt: row.archived_at,
-      tags: row.tags.split("|").map((tag) => tag.trim()).filter(Boolean),
-      readingMinutes: Number(row.reading_minutes) || 1,
-      blocks,
-    };
-  });
+const sheetArticles = articlesFromSheet(articleRows, blockRows);
+const inboxArticles = await loadInboxArticles();
+const { articles, added, replaced } = mergeArticles(sheetArticles, inboxArticles);
 
 const destination = resolve(root, "data/articles.json");
 await mkdir(dirname(destination), { recursive: true });
@@ -118,4 +200,6 @@ await writeFile(
 );
 
 const blockCount = articles.reduce((sum, article) => sum + article.blocks.length, 0);
-console.log(`已同步 ${articles.length} 篇文章、${blockCount} 个正文块。`);
+console.log(
+  `已同步 ${articles.length} 篇文章、${blockCount} 个正文块（Sheet ${sheetArticles.length} 篇，inbox ${inboxArticles.length} 篇，新增 ${added} 篇，覆盖 ${replaced} 篇）。`,
+);
