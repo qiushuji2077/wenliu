@@ -1,0 +1,2 @@
+id,title,deck,source_name,source_url,original_language,published_at,archived_at,tags,reading_minutes,status
+measuring-pace-of-ai-development,理解前沿实验室内部 AI 发展节奏的测量,Anthropic 公开三项内部测量：Claude 在 AI 研发中的自动化程度、智能体监督覆盖，以及算力中安全工作占比，并说明其他开发者今天就能按同一口径定期发布。,Anthropic,https://www.anthropic.com/institute/measuring-pace-of-ai-development,英文,2026-09-17,2026-09-18,AI安全|研发自动化|Anthropic|透明披露,23,published
